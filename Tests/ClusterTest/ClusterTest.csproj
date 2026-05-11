@@ -5,6 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RocksDbPackageVersion>10.4.2.64152</RocksDbPackageVersion>
   </PropertyGroup>
 
   <ItemGroup>
@@ -13,8 +14,19 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- We need the local RocksDbSharp project for the C# API. -->
     <ProjectReference Include="..\..\csharp\RocksDbSharp.csproj" />
-    <PackageReference Include="RocksDB" Version="10.4.2.64152" ExcludeAssets="compile;runtime" PrivateAssets="all" GeneratePathProperty="true" />
-    <None Include="$(NuGetPackageRoot)RocksDB\10.4.2.64152\runtimes\**\*" CopyToOutputDirectory="PreserveNewest" Visible="false" TargetPath="runtimes\%(RecursiveDir)%(Filename)%(Extension)" />
+
+    <!-- The local project declares <PackageId>RocksDB</PackageId>, so a normal
+         <PackageReference Include="RocksDB" .../> is resolved against it and
+         the public NuGet package is never fetched. PackageDownload bypasses
+         that substitution and downloads the real package into the global
+         NuGet cache so its per-RID native binaries can be copied below. -->
+    <PackageDownload Include="RocksDB" Version="[$(RocksDbPackageVersion)]" />
+
+    <None Include="$(NuGetPackageRoot)rocksdb\$(RocksDbPackageVersion)\runtimes\**\*"
+          CopyToOutputDirectory="PreserveNewest"
+          Visible="false"
+          TargetPath="runtimes\%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
 </Project>
