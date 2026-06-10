@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace RocksDbSharp
 {
@@ -13,7 +15,7 @@ namespace RocksDbSharp
     {
         public string FileName { get; set; }
         public long Size { get; set; }
-        /// <summary>Identity signature (see <see cref="ReplicationDelta.ComputeFileSignature"/>). Empty for files that are never reused.</summary>
+        /// <summary>Identity signature (see <see cref="ReplicationDelta.ComputeFileSignatureAsync"/>). Empty for files that are never reused.</summary>
         public string Hash { get; set; }
     }
 
@@ -74,10 +76,15 @@ namespace RocksDbSharp
         /// whole-file hash inside the SST (blocks carry individual CRCs, which
         /// still guard reused files against corruption at read time).
         /// </summary>
-        public static string ComputeFileSignature(string path, int tailBytes = SignatureTailBytes)
+        public static async Task<string> ComputeFileSignatureAsync(
+            string path,
+            int tailBytes = SignatureTailBytes,
+            CancellationToken cancellationToken = default)
         {
             using (var sha = SHA256.Create())
-            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite,
+                                           bufferSize: 64 * 1024,
+                                           FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
                 var header = BitConverter.GetBytes(fs.Length);
                 sha.TransformBlock(header, 0, header.Length, null, 0);
@@ -86,7 +93,7 @@ namespace RocksDbSharp
                 fs.Seek(start, SeekOrigin.Begin);
                 var buffer = new byte[64 * 1024];
                 int read;
-                while ((read = fs.Read(buffer, 0, buffer.Length)) > 0)
+                while ((read = await fs.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false)) > 0)
                 {
                     sha.TransformBlock(buffer, 0, read, null, 0);
                 }
@@ -100,7 +107,7 @@ namespace RocksDbSharp
         /// are candidates for reuse in a delta transfer. Hashes are not
         /// computed here: they are only worth computing for files whose name
         /// and size match on both sides, so callers verify candidates through
-        /// a hash-request exchange (<see cref="ComputeFileSignature"/>) afterwards.
+        /// a hash-request exchange (<see cref="ComputeFileSignatureAsync"/>) afterwards.
         /// </summary>
         public static List<ReplicationFileInfo> ScanImmutableFiles(string directory)
         {
@@ -127,14 +134,15 @@ namespace RocksDbSharp
         /// otherwise null, without computing anything. Immutability is what
         /// makes hashing the live file (rather than a checkpoint copy) valid.
         /// </summary>
-        public static string TryHashCandidate(string directory, string fileName, long expectedSize)
+        public static async Task<string> TryHashCandidateAsync(
+            string directory, string fileName, long expectedSize, CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrEmpty(fileName) || Path.GetFileName(fileName) != fileName) return null;
             if (!IsImmutableFile(fileName)) return null;
             var path = Path.Combine(directory, fileName);
             var info = new FileInfo(path);
             if (!info.Exists || info.Length != expectedSize) return null;
-            return ComputeFileSignature(path);
+            return await ComputeFileSignatureAsync(path, SignatureTailBytes, cancellationToken).ConfigureAwait(false);
         }
 
         /// <summary>

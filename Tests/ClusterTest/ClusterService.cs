@@ -84,16 +84,16 @@ public class ClusterService : ServiceBase<IClusterService>, IClusterService
     /// immutable, so hashing the live file is equivalent to hashing the copy a
     /// later checkpoint would hard-link.
     /// </summary>
-    public UnaryResult<List<FileHashResult>> GetFileHashesAsync(List<FileHashQuery> files)
+    public async UnaryResult<List<FileHashResult>> GetFileHashesAsync(List<FileHashQuery> files)
     {
         var result = new List<FileHashResult>(files.Count);
         bool resyncing = _host.IsResyncing;
         foreach (var f in files)
         {
-            string? hash = resyncing ? null : ReplicationDelta.TryHashCandidate(_host.DbPath, f.Name, f.Size);
+            string? hash = resyncing ? null : await ReplicationDelta.TryHashCandidateAsync(_host.DbPath, f.Name, f.Size);
             result.Add(new FileHashResult { Name = f.Name, Found = hash != null, Hash = hash ?? "" });
         }
-        return new UnaryResult<List<FileHashResult>>(result);
+        return result;
     }
 
     public async Task<ServerStreamingResult<ClusterFileData>> SyncInitialStateAsync(SnapshotRequest req)
