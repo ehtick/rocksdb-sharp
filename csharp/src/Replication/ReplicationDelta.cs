@@ -13,7 +13,7 @@ namespace RocksDbSharp
     {
         public string FileName { get; set; }
         public long Size { get; set; }
-        /// <summary>SHA-256 of the file content (hex). Empty for files that are never reused.</summary>
+        /// <summary>Identity signature (see <see cref="ReplicationDelta.ComputeFileSignature"/>). Empty for files that are never reused.</summary>
         public string Hash { get; set; }
     }
 
@@ -37,24 +37,61 @@ namespace RocksDbSharp
     ///
     /// Granularity is whole files: a changed file is re-transferred in full,
     /// there is no content-level patching. Only immutable files (.sst / .blob)
-    /// are ever reused. Matching requires name + size + SHA-256, because two
-    /// RocksDB instances allocate file numbers independently once they stop
-    /// sharing a lineage - files with equal names (and even equal sizes) on
-    /// different nodes are not guaranteed to hold the same content.
+    /// are ever reused. Matching requires name + size + identity signature,
+    /// because two RocksDB instances allocate file numbers independently once
+    /// they stop sharing a lineage - files with equal names (and even equal
+    /// sizes) on different nodes are not guaranteed to hold the same content.
     /// </summary>
     public static class ReplicationDelta
     {
+        /// <summary>
+        /// How much of the end of a file the signature covers. The tail of an
+        /// SST holds the footer, the (top-level) index and the properties
+        /// block - which embeds RocksDB's own identity material: the creating
+        /// DB's UUID, the DB session identity (unique per instance run), the
+        /// original file number and the creation timestamps. Two SSTs from
+        /// different creation events therefore always differ inside this
+        /// window, while byte-copies are identical everywhere. 1 MiB leaves
+        /// ample margin for the index/metaindex blocks of large files.
+        /// </summary>
+        public const int SignatureTailBytes = 1024 * 1024;
+
         public static bool IsImmutableFile(string fileName) =>
             fileName.EndsWith(".sst", StringComparison.OrdinalIgnoreCase) ||
             fileName.EndsWith(".blob", StringComparison.OrdinalIgnoreCase);
 
-        public static string ComputeFileHash(string path)
+        /// <summary>
+        /// Identity signature of an immutable file: SHA-256 over the file
+        /// length and the last <paramref name="tailBytes"/> bytes.
+        ///
+        /// Hashing the *head* instead would not be safe: a replica's locally
+        /// flushed SST can carry a byte-identical data prefix (same keys,
+        /// values and sequence numbers ingested from the WAL stream) and only
+        /// differ near the end, where the identity properties live. Hashing
+        /// the tail compares exactly that identity material - it is the same
+        /// discriminator RocksDB's "unique SST id" is built from - without
+        /// reading multi-gigabyte files in full. RocksDB itself stores no
+        /// whole-file hash inside the SST (blocks carry individual CRCs, which
+        /// still guard reused files against corruption at read time).
+        /// </summary>
+        public static string ComputeFileSignature(string path, int tailBytes = SignatureTailBytes)
         {
             using (var sha = SHA256.Create())
             using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
             {
-                var hash = sha.ComputeHash(fs);
-                return BitConverter.ToString(hash).Replace("-", string.Empty);
+                var header = BitConverter.GetBytes(fs.Length);
+                sha.TransformBlock(header, 0, header.Length, null, 0);
+
+                long start = Math.Max(0, fs.Length - tailBytes);
+                fs.Seek(start, SeekOrigin.Begin);
+                var buffer = new byte[64 * 1024];
+                int read;
+                while ((read = fs.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    sha.TransformBlock(buffer, 0, read, null, 0);
+                }
+                sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+                return BitConverter.ToString(sha.Hash).Replace("-", string.Empty);
             }
         }
 
@@ -63,7 +100,7 @@ namespace RocksDbSharp
         /// are candidates for reuse in a delta transfer. Hashes are not
         /// computed here: they are only worth computing for files whose name
         /// and size match on both sides, so callers verify candidates through
-        /// a hash-request exchange (<see cref="ComputeFileHash"/>) afterwards.
+        /// a hash-request exchange (<see cref="ComputeFileSignature"/>) afterwards.
         /// </summary>
         public static List<ReplicationFileInfo> ScanImmutableFiles(string directory)
         {
@@ -97,7 +134,7 @@ namespace RocksDbSharp
             var path = Path.Combine(directory, fileName);
             var info = new FileInfo(path);
             if (!info.Exists || info.Length != expectedSize) return null;
-            return ComputeFileHash(path);
+            return ComputeFileSignature(path);
         }
 
         /// <summary>

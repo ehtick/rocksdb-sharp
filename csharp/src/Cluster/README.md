@@ -224,10 +224,18 @@ The resync itself (`ClusterNodeHost.PerformResyncAsync`):
   leader's checkpoint (`ReplicationDelta` in `csharp/src/Replication`, so the
   plain replication path can use the same mechanism):
   - the node scans its local immutable files (`.sst` / `.blob`) by name and
-    size only, then asks the leader for content hashes via
-    `GetFileHashesAsync`. The leader hashes only the files it also holds at
-    that exact name + size, and the node hashes only its copies of those
-    candidates - files that cannot match are never hashed on either side;
+    size only, then asks the leader for identity signatures via
+    `GetFileHashesAsync`. The leader signs only the files it also holds at
+    that exact name + size, and the node signs only its copies of those
+    candidates - files that cannot match are never read on either side.
+    The signature hashes the file length plus the **last 1 MiB** rather than
+    the whole file: an SST's tail contains its footer, index and properties
+    block, which embeds RocksDB's own identity material (creating-DB UUID,
+    DB session identity, original file number, creation times), so distinct
+    creation events always differ there while byte-copies match. Hashing the
+    *head* would not be safe - a replica's locally flushed SST can carry a
+    byte-identical data prefix and differ only near the end. Per-block CRCs
+    inside the SST still guard reused files against corruption at read time;
   - the node sends the verified files as its inventory; the leader answers
     with a plan: verified files are **reused**, and it streams - chunked, in
     full - only the files that are **new or changed**. Granularity is whole

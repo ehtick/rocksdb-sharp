@@ -353,7 +353,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
             foreach (var h in sourceHashes)
             {
                 if (!h.Found) continue;
-                var localHash = ReplicationDelta.ComputeFileHash(Path.Combine(_cfg.DbPath, h.Name));
+                var localHash = ReplicationDelta.ComputeFileSignature(Path.Combine(_cfg.DbPath, h.Name));
                 if (string.Equals(localHash, h.Hash, StringComparison.OrdinalIgnoreCase))
                     verified.Add(new FileInventoryItem { Name = h.Name, Size = sizeByName[h.Name] });
             }
