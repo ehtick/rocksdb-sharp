@@ -18,8 +18,7 @@ internal static class Program
     {
         if (args.Length == 0 || args[0] == "coordinator")
         {
-            await new Coordinator().RunAsync(args.Skip(1).ToArray());
-            return 0;
+            return await new Coordinator().RunAsync(args.Skip(1).ToArray());
         }
 
         if (args[0] == "node")
@@ -32,34 +31,43 @@ internal static class Program
             await host.StartAsync();
 
             // The "writer" role drives traffic when this node is the leader.
+            // Every Put goes through TryWriteAsLeader so a deposed leader stops
+            // writing immediately instead of polluting its local WAL.
             _ = Task.Run(async () =>
             {
                 long counter = 0;
                 while (true)
                 {
-                    if (host.Node.Role == RocksDbSharp.RaftRole.Leader)
+                    if (host.WriteLoadEnabled)
                     {
                         for (int i = 0; i < 200; i++)
                         {
-                            string key = $"{host.Node.NodeId}_{counter++:D012}";
-                            host.Db.Put(key, $"{Stopwatch.GetTimestamp()}");
+                            string key = $"{host.Node.NodeId}_{counter:D012}";
+                            if (!host.TryWriteAsLeader(key, $"{Stopwatch.GetTimestamp()}")) break;
+                            counter++;
                         }
                     }
                     await Task.Delay(50);
                 }
             });
 
-            // Console reporting once per second
+            // Console reporting once per two seconds
             _ = Task.Run(async () =>
             {
                 while (true)
                 {
-                    Console.WriteLine($"[{DateTimeOffset.UtcNow:HH:mm:ss.fff} {host.Node.NodeId}] " +
-                                      $"role={host.Node.Role} term={host.Node.CurrentTerm} " +
-                                      $"leader={host.Node.CurrentLeaderId} " +
-                                      $"latest={host.Db.GetLatestSequenceNumber():n0} " +
-                                      $"commit={host.Node.CommitSeq:n0} mode={host.Node.Mode} " +
-                                      $"bootSync={host.Node.BootstrapInSyncCount}");
+                    try
+                    {
+                        ulong latest = host.IsResyncing ? 0 : host.Db.GetLatestSequenceNumber();
+                        Console.WriteLine($"[{DateTimeOffset.UtcNow:HH:mm:ss.fff} {host.Node.NodeId}] " +
+                                          $"role={host.Node.Role} term={host.Node.CurrentTerm} " +
+                                          $"leader={host.Node.CurrentLeaderId} " +
+                                          $"latest={latest:n0} " +
+                                          $"commit={host.Node.CommitSeq:n0} mode={host.Node.Mode} " +
+                                          $"bootSync={host.Node.BootstrapInSyncCount}" +
+                                          (host.IsResyncing ? " RESYNCING" : ""));
+                    }
+                    catch { }
                     await Task.Delay(2000);
                 }
             });
@@ -80,6 +88,12 @@ internal sealed class Coordinator
     private readonly string _exePath;
     private readonly string _argsPrefix;
     private readonly List<NodeProcess> _processes = new();
+
+    // ---- Raft invariant tracking (fed by every status poll) ----
+    private readonly object _invariantGate = new();
+    private readonly Dictionary<string, long> _highestTermSeen = new();   // nodeId -> term
+    private readonly Dictionary<long, string> _leaderByTerm = new();      // term -> leaderId
+    private readonly List<string> _violations = new();
 
     public Coordinator()
     {
@@ -108,7 +122,7 @@ internal sealed class Coordinator
         }
     }
 
-    public async Task RunAsync(string[] args)
+    public async Task<int> RunAsync(string[] args)
     {
         string scenario = args.Length > 0 ? args[0] : "all";
 
@@ -129,8 +143,15 @@ internal sealed class Coordinator
                     break;
                 default:
                     Console.Error.WriteLine($"Unknown scenario '{scenario}'. Use: election | crash | hang | rejoin | all");
-                    return;
+                    return 2;
             }
+            Log("ALL SCENARIOS PASSED");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Log($"FAILED: {ex.Message}");
+            return 1;
         }
         finally
         {
@@ -145,13 +166,19 @@ internal sealed class Coordinator
     private async Task ScenarioElectionAsync()
     {
         Log("=== scenario: bootstrap → cluster mode promotion ===");
-        var cluster = StartCluster(3, scenarioName: "election");
+        var cluster = StartCluster(3, scenarioName: "election", basePort: 51000);
 
         await WaitForClusterModeAsync(cluster, TimeSpan.FromSeconds(45));
         Log("cluster has switched to Cluster mode");
 
         var leader = await WaitForLeaderAsync(cluster, TimeSpan.FromSeconds(20));
         Log($"current leader = {leader}");
+
+        // Committed (quorum-acknowledged) writes must succeed on the leader.
+        var keys = await WriteCommittedKeysAsync(EndpointOf(cluster, leader), "committed_election", 50);
+        Log($"wrote {keys.Count} committed keys");
+
+        await ValidateClusterConsistencyAsync(cluster);
 
         KillAll();
         await Task.Delay(500);
@@ -160,10 +187,15 @@ internal sealed class Coordinator
     private async Task ScenarioLeaderCrashAsync()
     {
         Log("=== scenario: leader crash → re-election ===");
-        var cluster = StartCluster(3, scenarioName: "crash");
+        var cluster = StartCluster(3, scenarioName: "crash", basePort: 51010);
         await WaitForClusterModeAsync(cluster, TimeSpan.FromSeconds(45));
         var leader = await WaitForLeaderAsync(cluster, TimeSpan.FromSeconds(20));
         Log($"initial leader = {leader}");
+
+        // These writes are acknowledged as committed, so Raft's Leader
+        // Completeness property says they must survive the crash.
+        var keys = await WriteCommittedKeysAsync(EndpointOf(cluster, leader), "committed_crash", 100);
+        Log($"wrote {keys.Count} committed keys on {leader}");
 
         var leaderProc = cluster.First(c => c.Config.NodeId == leader);
         Log($"killing leader {leader} (pid {leaderProc.Process.Id})");
@@ -175,6 +207,12 @@ internal sealed class Coordinator
         var newLeader = await WaitForLeaderAsync(remaining, TimeSpan.FromSeconds(30), differentFrom: leader);
         Log($"new leader = {newLeader}");
 
+        await VerifyKeysPresentAsync(EndpointOf(remaining, newLeader), keys,
+            $"all committed writes survive the failover to {newLeader}");
+        Log("all committed writes survived the failover");
+
+        await ValidateClusterConsistencyAsync(remaining);
+
         KillAll();
         await Task.Delay(500);
     }
@@ -182,23 +220,29 @@ internal sealed class Coordinator
     private async Task ScenarioLeaderHangAsync()
     {
         Log("=== scenario: leader hang (SIGSTOP) → re-election → SIGCONT ===");
-        var cluster = StartCluster(3, scenarioName: "hang");
+        var cluster = StartCluster(3, scenarioName: "hang", basePort: 51020);
         await WaitForClusterModeAsync(cluster, TimeSpan.FromSeconds(45));
         var leader = await WaitForLeaderAsync(cluster, TimeSpan.FromSeconds(20));
         Log($"initial leader = {leader}");
+
+        var keysBefore = await WriteCommittedKeysAsync(EndpointOf(cluster, leader), "committed_prehang", 50);
 
         var leaderProc = cluster.First(c => c.Config.NodeId == leader);
         Log($"freezing leader {leader} (pid {leaderProc.Process.Id})");
         if (!StopProcess(leaderProc.Process))
         {
-            Log("SIGSTOP unavailable on this OS; falling back to Kill");
-            leaderProc.Process.Kill(entireProcessTree: true);
+            Log("SIGSTOP unavailable on this OS; skipping the hang scenario");
+            KillAll();
+            return;
         }
 
         // followers should elect a new leader once the heartbeat lapses
         var remaining = cluster.Where(c => c.Config.NodeId != leader).ToList();
         var newLeader = await WaitForLeaderAsync(remaining, TimeSpan.FromSeconds(30), differentFrom: leader);
         Log($"new leader (while old is frozen) = {newLeader}");
+
+        var keysAfter = await WriteCommittedKeysAsync(EndpointOf(remaining, newLeader), "committed_posthang", 50);
+        Log($"wrote {keysAfter.Count} committed keys on the new leader");
 
         // resume the frozen node and confirm it becomes a follower of the new leader
         Log($"resuming {leader}");
@@ -210,6 +254,15 @@ internal sealed class Coordinator
             return s != null && s.LeaderId == newLeader && s.Role == "Follower";
         }, TimeSpan.FromSeconds(20), $"resumed node {leader} accepts {newLeader} as leader");
 
+        await VerifyKeysPresentAsync(EndpointOf(cluster, newLeader), keysBefore.Concat(keysAfter).ToList(),
+            "committed writes from before and after the hang are all present");
+
+        // The resumed node may have accepted uncommitted writes while it still
+        // believed it was the leader; it must detect the divergence, resync,
+        // and converge to a byte-identical copy. The consistency check below
+        // proves both the resync path and the loss of unacknowledged writes.
+        await ValidateClusterConsistencyAsync(cluster, timeout: TimeSpan.FromSeconds(90));
+
         KillAll();
         await Task.Delay(500);
     }
@@ -217,7 +270,7 @@ internal sealed class Coordinator
     private async Task ScenarioFollowerCrashRejoinAsync()
     {
         Log("=== scenario: follower crash → restart → catch-up ===");
-        var cluster = StartCluster(3, scenarioName: "rejoin");
+        var cluster = StartCluster(3, scenarioName: "rejoin", basePort: 51030);
         await WaitForClusterModeAsync(cluster, TimeSpan.FromSeconds(45));
         var leader = await WaitForLeaderAsync(cluster, TimeSpan.FromSeconds(20));
 
@@ -233,23 +286,168 @@ internal sealed class Coordinator
         await WaitUntilAsync(async () =>
         {
             var s = await TryGetStatusAsync(follower.Config.Endpoint);
-            if (s == null) return false;
-            var leaderStatus = await TryGetStatusAsync(cluster.First(c => c.Config.NodeId == leader).Config.Endpoint);
+            if (s == null || s.Resyncing) return false;
+            var leaderStatus = await TryGetStatusAsync(EndpointOf(cluster, leader));
             if (leaderStatus == null) return false;
             return s.LatestSeq + 5000 >= leaderStatus.LatestSeq;
         }, TimeSpan.FromSeconds(60), $"follower {follower.Config.NodeId} caught back up");
+
+        var alive = cluster.Where(c => !c.Process.HasExited).ToList();
+        await ValidateClusterConsistencyAsync(alive);
 
         KillAll();
         await Task.Delay(500);
     }
 
     // -----------------------------------------------------------------------
+    // Raft validation helpers
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Fed with every status poll. Checks the observable Raft invariants:
+    ///  - Election Safety: at most one leader per term;
+    ///  - terms are monotonically non-decreasing on every node;
+    ///  - the commit index never exceeds the log tail.
+    /// Violations are recorded and surfaced at the next validation point
+    /// (throwing here would be swallowed by the polling loops).
+    /// </summary>
+    private void CheckInvariants(NodeStatus s)
+    {
+        lock (_invariantGate)
+        {
+            if (_highestTermSeen.TryGetValue(s.NodeId, out var prev) && s.Term < prev)
+                _violations.Add($"term went backwards on {s.NodeId}: {prev} -> {s.Term}");
+            _highestTermSeen[s.NodeId] = Math.Max(s.Term, _highestTermSeen.GetValueOrDefault(s.NodeId));
+
+            if (s.Role == "Leader")
+            {
+                if (_leaderByTerm.TryGetValue(s.Term, out var other) && other != s.NodeId)
+                    _violations.Add($"ELECTION SAFETY VIOLATION: two leaders in term {s.Term}: {other} and {s.NodeId}");
+                _leaderByTerm[s.Term] = s.NodeId;
+            }
+
+            if (!s.Resyncing && s.CommitSeq > s.LatestSeq)
+                _violations.Add($"commit ({s.CommitSeq}) ahead of log tail ({s.LatestSeq}) on {s.NodeId}");
+        }
+    }
+
+    private void AssertNoViolations()
+    {
+        lock (_invariantGate)
+        {
+            if (_violations.Count > 0)
+                throw new InvalidOperationException("Raft invariant violations:\n  " + string.Join("\n  ", _violations.Distinct()));
+        }
+    }
+
+    private async Task<List<string>> WriteCommittedKeysAsync(string leaderEndpoint, string prefix, int count)
+    {
+        var keys = new List<string>(count);
+        using var ch = GrpcChannel.ForAddress(leaderEndpoint);
+        var client = MagicOnionClient.Create<IClusterService>(ch);
+        for (int i = 0; i < count; i++)
+        {
+            string key = $"{prefix}_{i:D6}";
+            bool ok = await client.WriteAsync(new WriteRequest { Key = key, Value = $"v{i}" });
+            if (!ok) throw new InvalidOperationException($"committed write '{key}' was not acknowledged by {leaderEndpoint}");
+            keys.Add(key);
+        }
+        return keys;
+    }
+
+    private async Task VerifyKeysPresentAsync(string endpoint, List<string> keys, string label)
+    {
+        using var ch = GrpcChannel.ForAddress(endpoint);
+        var client = MagicOnionClient.Create<IClusterService>(ch);
+        var missing = new List<string>();
+        foreach (var key in keys)
+        {
+            var r = await client.ReadAsync(key);
+            if (!r.Found) missing.Add(key);
+        }
+        if (missing.Count > 0)
+            throw new InvalidOperationException(
+                $"DURABILITY VIOLATION ({label}): {missing.Count}/{keys.Count} committed keys missing, e.g. {missing[0]}");
+    }
+
+    /// <summary>
+    /// Quiesces the write load, waits for every node to converge to the same
+    /// log tail with a fully advanced commit index, then compares whole-DB
+    /// checksums. Identical checksums on all replicas is the State Machine
+    /// Safety property made observable.
+    /// </summary>
+    private async Task ValidateClusterConsistencyAsync(IEnumerable<NodeProcess> nodes, TimeSpan? timeout = null)
+    {
+        var list = nodes.Where(n => !n.Process.HasExited).ToList();
+        Log($"validating consistency across {list.Count} nodes...");
+
+        foreach (var n in list)
+        {
+            try
+            {
+                using var ch = GrpcChannel.ForAddress(n.Config.Endpoint);
+                var client = MagicOnionClient.Create<IClusterService>(ch);
+                await client.SetWriteLoadAsync(false);
+            }
+            catch { }
+        }
+
+        await WaitUntilAsync(async () =>
+        {
+            var statuses = new List<NodeStatus>();
+            foreach (var n in list)
+            {
+                var s = await TryGetStatusAsync(n.Config.Endpoint);
+                if (s == null || s.Resyncing) return false;
+                statuses.Add(s);
+            }
+            if (statuses.Count(s => s.Role == "Leader") != 1) return false;
+            if (statuses.Select(s => s.LatestSeq).Distinct().Count() != 1) return false;
+            // commit must catch up to the tail once the cluster is quiescent
+            return statuses.All(s => s.CommitSeq == s.LatestSeq);
+        }, timeout ?? TimeSpan.FromSeconds(45), "all nodes converged to the same committed log tail");
+
+        var sums = new List<(string NodeId, ChecksumResponse Sum)>();
+        foreach (var n in list)
+        {
+            using var ch = GrpcChannel.ForAddress(n.Config.Endpoint);
+            var client = MagicOnionClient.Create<IClusterService>(ch);
+            var sum = await client.ChecksumAsync();
+            if (!sum.Available) throw new InvalidOperationException($"checksum unavailable on {n.Config.NodeId}");
+            sums.Add((n.Config.NodeId, sum));
+        }
+
+        var first = sums[0];
+        foreach (var (nodeId, sum) in sums.Skip(1))
+        {
+            if (sum.Hash != first.Sum.Hash || sum.KeyCount != first.Sum.KeyCount)
+                throw new InvalidOperationException(
+                    "STATE MACHINE SAFETY VIOLATION: replicas diverge: " +
+                    string.Join(", ", sums.Select(x => $"{x.NodeId}: {x.Sum.KeyCount} keys / {x.Sum.Hash:x16}")));
+        }
+
+        AssertNoViolations();
+        Log($"consistency OK: {first.Sum.KeyCount:n0} keys, checksum {first.Sum.Hash:x16}, on {sums.Count} nodes");
+    }
+
+    private static string EndpointOf(IEnumerable<NodeProcess> cluster, string nodeId) =>
+        cluster.First(c => c.Config.NodeId == nodeId).Config.Endpoint;
+
+    // -----------------------------------------------------------------------
     // Cluster bootstrap helpers
     // -----------------------------------------------------------------------
 
-    private List<NodeProcess> StartCluster(int nodeCount, string scenarioName)
+    private List<NodeProcess> StartCluster(int nodeCount, string scenarioName, int basePort)
     {
-        int basePort = 51000 + (Math.Abs(scenarioName.GetHashCode()) % 50) * 10;
+        // Raft invariants hold within one cluster; each scenario boots a fresh
+        // cluster whose terms restart at 1, so the trackers must restart too.
+        lock (_invariantGate)
+        {
+            _highestTermSeen.Clear();
+            _leaderByTerm.Clear();
+            _violations.Clear();
+        }
+
         var members = new List<MemberConfig>();
         for (int i = 0; i < nodeCount; i++)
         {
@@ -369,13 +567,15 @@ internal sealed class Coordinator
         throw new TimeoutException($"Timeout waiting for: {label}");
     }
 
-    private static async Task<NodeStatus?> TryGetStatusAsync(string endpoint)
+    private async Task<NodeStatus?> TryGetStatusAsync(string endpoint)
     {
         try
         {
             using var ch = GrpcChannel.ForAddress(endpoint);
             var client = MagicOnionClient.Create<IClusterService>(ch);
-            return await client.GetStatusAsync();
+            var s = await client.GetStatusAsync();
+            if (s != null) CheckInvariants(s);
+            return s;
         }
         catch
         {

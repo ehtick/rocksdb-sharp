@@ -25,8 +25,15 @@ public interface IClusterService : IService<IClusterService>
     Task<ServerStreamingResult<ClusterBatchData>> SyncUpdatesAsync(SyncUpdatesRequest req);
     UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seqNumber);
 
+    // ---- Log consistency / resync ----
+    UnaryResult<LogConsistencyResponse> CheckLogConsistencyAsync(LogConsistencyRequest req);
+    UnaryResult<string> GetRaftTermsAsync();
+
     // ---- Testing helpers ----
     UnaryResult<bool> WriteAsync(WriteRequest req);
+    UnaryResult<ReadResponse> ReadAsync(string key);
+    UnaryResult<ChecksumResponse> ChecksumAsync();
+    UnaryResult<bool> SetWriteLoadAsync(bool enabled);
 }
 
 // =============== DTOs ===============
@@ -103,6 +110,7 @@ public class NodeStatus
     [Key(6)] public int Mode { get; set; }
     [Key(7)] public List<PeerInfo> Peers { get; set; } = new();
     [Key(8)] public int BootstrapInSyncCount { get; set; }
+    [Key(9)] public bool Resyncing { get; set; }
 }
 
 [MessagePackObject]
@@ -113,6 +121,11 @@ public class PeerInfo
     [Key(2)] public bool Reachable { get; set; }
 }
 
+/// <summary>
+/// One chunk of one checkpoint file. Files are streamed in contiguous chunks
+/// (a new FileName starts a new file) so a single message never exceeds the
+/// gRPC max-message size regardless of how large the SST files are.
+/// </summary>
 [MessagePackObject]
 public class ClusterFileData
 {
@@ -129,6 +142,38 @@ public class SyncUpdatesRequest
 }
 
 [MessagePackObject]
+public class LogConsistencyRequest
+{
+    [Key(0)] public string NodeId { get; set; } = "";
+    [Key(1)] public ulong FollowerLatestSeq { get; set; }
+    [Key(2)] public long FollowerTermAtLatest { get; set; }
+}
+
+[MessagePackObject]
+public class LogConsistencyResponse
+{
+    [Key(0)] public bool IsLeader { get; set; }
+    [Key(1)] public bool Consistent { get; set; }
+    [Key(2)] public long Term { get; set; }
+}
+
+[MessagePackObject]
+public class ReadResponse
+{
+    [Key(0)] public bool Found { get; set; }
+    [Key(1)] public string? Value { get; set; }
+}
+
+[MessagePackObject]
+public class ChecksumResponse
+{
+    [Key(0)] public bool Available { get; set; }
+    [Key(1)] public long KeyCount { get; set; }
+    [Key(2)] public ulong Hash { get; set; }
+    [Key(3)] public ulong LatestSeq { get; set; }
+}
+
+[MessagePackObject]
 [MessagePackFormatter(typeof(PooledClusterBatchDataSerializer))]
 public class ClusterBatchData
 {
@@ -136,7 +181,15 @@ public class ClusterBatchData
     [Key(1)] public int Length { get; set; }
     [Key(2)] public long LeaderTerm { get; set; }
     [Key(3)] public string LeaderId { get; set; } = "";
-    [Key(4)] public byte[] PooledData { get; set; } = Array.Empty<byte>();
+    /// <summary>
+    /// Term of this batch itself (from the leader's term map), as opposed to
+    /// <see cref="LeaderTerm"/> which is the leader's current term. A follower
+    /// catching up replays old batches whose entry term is lower than the
+    /// leader's current term; recording LeaderTerm for them would corrupt the
+    /// follower's term map and break the election up-to-date comparison.
+    /// </summary>
+    [Key(4)] public long EntryTerm { get; set; }
+    [Key(5)] public byte[] PooledData { get; set; } = Array.Empty<byte>();
 
     [IgnoreMember] public ReadOnlySpan<byte> Data => PooledData.AsSpan(0, Length);
 
@@ -156,7 +209,8 @@ public class PooledClusterBatchDataSerializer : IMessagePackFormatter<ClusterBat
         d.Length = reader.ReadInt32();
         d.LeaderTerm = reader.ReadInt64();
         d.LeaderId = reader.ReadString() ?? "";
-        var pooled = ArrayPool<byte>.Shared.Rent(d.Length);
+        d.EntryTerm = reader.ReadInt64();
+        var pooled = ArrayPool<byte>.Shared.Rent(Math.Max(1, d.Length));
         var raw = reader.ReadRaw(d.Length);
         raw.CopyTo(pooled.AsSpan(0, d.Length));
         d.PooledData = pooled;
@@ -169,6 +223,7 @@ public class PooledClusterBatchDataSerializer : IMessagePackFormatter<ClusterBat
         writer.WriteInt32(value.Length);
         writer.WriteInt64(value.LeaderTerm);
         writer.Write(value.LeaderId);
+        writer.WriteInt64(value.EntryTerm);
         writer.WriteRaw(value.PooledData.AsSpan(0, value.Length));
     }
 }

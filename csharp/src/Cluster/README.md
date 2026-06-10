@@ -124,8 +124,18 @@ In Cluster mode every node enforces full Raft:
 - **Commit advancement**: the leader keeps a `matchSeq` per peer; on each
   reported progress it sorts the values plus its own `latestSeq` descending,
   picks the value at quorum index (`majority-1`), and that becomes the new
-  `commitSeq`. Followers receive `leaderCommit` on the next heartbeat and
-  advance theirs accordingly.
+  `commitSeq` - **but only if that entry belongs to the leader's current
+  term** (Raft §5.4.2: entries from previous terms are never committed by
+  counting replicas; they commit implicitly once a current-term entry does).
+  To avoid stalling until the first user write, a new leader immediately puts
+  a no-op marker entry (`RaftClusterNode.LeaderNoOpKey`) in its own term.
+  Followers receive `leaderCommit` on the next heartbeat and advance theirs
+  accordingly.
+- **matchSeq trust**: a heartbeat acknowledgement only confirms the prefix up
+  to `prevLogSeq` (that is what the term check validated); `matchSeq` beyond
+  that advances exclusively through the WAL-stream progress reports, which
+  are trustworthy because the stream is gated by the attach-time consistency
+  check described below.
 
 ---
 
@@ -151,10 +161,16 @@ mapping from "log index" to "WAL seqNo".
 5. The candidate counts grants. As soon as it has `Quorum` votes
    (including its own), it calls `BecomeLeader()`:
    - record a new term-range row at `latestSeq + 1`,
-   - reset every peer's `nextSeq` to `latestSeq + 1`,
+   - reset every peer's `nextSeq` to `latestSeq + 1` **and `matchSeq` to 0**
+     (progress learned during a previous leadership is stale),
+   - write the current-term no-op entry so the commit index can advance,
    - pause the election timer,
    - start the heartbeat loop, which immediately notifies all peers of the new
      term and leader id.
+   The whole campaign is pinned to the term captured at the moment the node
+   became candidate: if any concurrent vote or heartbeat moves the term, the
+   campaign is abandoned rather than re-run under the newer term (where this
+   node may already have granted its vote to someone else).
 6. If the candidate sees any response with a higher term, it steps down to
    Follower for that term.
 7. If the election timer fires again before a quorum, the candidate starts a
@@ -172,6 +188,51 @@ Persistence guarantees during elections:
 This is what makes the algorithm safe across crashes - a candidate that wins
 then dies cannot come back as a follower of a lower term and accept
 conflicting log entries.
+
+---
+
+## Log divergence detection & full resync
+
+Classical Raft repairs a diverged follower by truncating the conflicting
+suffix of its log. A RocksDB WAL cannot be truncated, so divergence is
+handled by rebuilding the whole replica from a leader snapshot instead.
+Three layers detect it:
+
+1. **Attach-time consistency check.** Before a follower starts (or restarts)
+   the WAL stream it calls `CheckLogConsistencyAsync(latestSeq, termAtLatest)`
+   on the leader. The leader confirms that exact `(seq, term)` pair exists in
+   its own log (`RaftClusterNode.CheckFollowerLogConsistency`). A follower
+   that is *ahead* of the leader, or whose tail carries a different term,
+   is told to resync. This is what catches a deposed leader rejoining with
+   uncommitted writes in its WAL.
+2. **Per-batch sequence verification.** While consuming the stream, the
+   follower requires every batch to land at exactly
+   `localLatestSeq + 1`. A gap means the leader's WAL no longer reaches back
+   far enough (e.g. the follower was down past the WAL TTL); an overlap means
+   a stray local write slipped in. Either way: resync.
+3. **Heartbeat prev-term check.** `HandleAppendEntries` compares
+   `prevLogTerm` against the local term map and raises
+   `RaftClusterNode.ResyncRequired` on a mismatch.
+
+The resync itself (`ClusterNodeHost.PerformResyncAsync`):
+
+- `Node.BeginResync()` pauses the election timer and makes the node refuse
+  votes (a voter with a half-rebuilt log could help elect a candidate that
+  lacks committed entries) and answer heartbeats with `"resyncing"` without
+  touching the database;
+- the local DB is disposed and the data directory wiped **except** the
+  `raft/` state directory (term and vote must survive - they are promises);
+- a checkpoint is pulled from the current leader via the chunked
+  `SyncInitialStateAsync` stream, followed by the leader's term map
+  (`GetRaftTermsAsync`) - the restored log is byte-for-byte the leader's log,
+  so the leader's term map is its correct description;
+- `Node.CompleteResync(newDb)` swaps the database in and re-arms the
+  election timer, and the WAL stream re-attaches (passing the attach-time
+  check this time).
+
+Unacknowledged writes that lived in the discarded WAL are gone, which is
+exactly Raft's contract: only **committed** (quorum-acknowledged) writes are
+durable.
 
 ---
 
@@ -219,11 +280,13 @@ There is a small write-visibility window: between the moment the leader
 freezes and the moment it discovers the higher term, it would happily accept
 client writes (it still believes it is leader). Those writes never reach a
 quorum so they never commit; when the node steps down, RocksDB's WAL still
-contains them. They will be **overwritten on resync if the new leader's log
-diverges**: the follower's `HandleAppendEntries` returns
-`Success = false, Reason = "term-mismatch"` and the host code re-snapshots
-from the leader via `SyncInitialStateAsync`. From a client's point of view
-the uncommitted writes simply never happened - they were never acknowledged.
+contains them. The attach-time consistency check (see *Log divergence
+detection & full resync* above) catches the divergent tail when the node
+re-attaches to the new leader, and the replica is rebuilt from a snapshot.
+From a client's point of view the uncommitted writes simply never happened -
+they were never acknowledged. `ClusterTest`'s `hang` scenario exercises
+exactly this path and then proves all three replicas converge to
+byte-identical contents.
 
 This is the standard Raft trade-off: only **committed** writes are durable.
 Uncommitted writes on a deposed leader are silently dropped.
@@ -377,3 +440,17 @@ Tuning notes:
 
 See `Tests/ClusterTest/Program.cs` for a working coordinator that drives the
 four canonical scenarios end-to-end: `election`, `crash`, `hang`, `rejoin`.
+
+The coordinator validates the observable Raft properties while it runs:
+
+- **Election Safety** - every status poll is checked: no two nodes may ever
+  report themselves leader of the same term, and a node's term never goes
+  backwards.
+- **Leader Completeness / durability** - `WriteAsync` acknowledges only after
+  the entry is *committed* (replicated to a quorum); the `crash` and `hang`
+  scenarios then assert every acknowledged key is still readable after the
+  failover.
+- **State Machine Safety** - at the end of each scenario the write load is
+  quiesced, the coordinator waits for every replica to converge to the same
+  log tail with `commitSeq == latestSeq`, and whole-database checksums
+  (`ChecksumAsync`) must be identical on every node.
