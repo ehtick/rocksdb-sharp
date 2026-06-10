@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -26,9 +27,18 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     public RocksDb Db { get; private set; } = null!;
     public RaftClusterNode Node { get; private set; } = null!;
 
+    public string DbPath => _cfg.DbPath;
+    public bool IsResyncing => _resyncing;
+    public bool WriteLoadEnabled
+    {
+        get => _writeLoadEnabled;
+        set => _writeLoadEnabled = value;
+    }
+
     private readonly NodeConfiguration _cfg;
     private readonly ClusterPeerTransport _transport = new();
     private readonly CancellationTokenSource _cts = new();
+    private readonly SemaphoreSlim _resyncGate = new(1, 1);
 
     private WebApplication? _app;
     private Task? _appRunTask;
@@ -36,6 +46,8 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     private string? _currentFollowingLeader;
     private CancellationTokenSource? _followerCts;
     private RaftPersistentState? _state;
+    private volatile bool _resyncing;
+    private volatile bool _writeLoadEnabled = true;
 
     public ClusterNodeHost(NodeConfiguration cfg)
     {
@@ -45,26 +57,20 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     public async Task StartAsync()
     {
         Directory.CreateDirectory(_cfg.DbPath);
-        var walDir = Path.Combine(_cfg.DbPath, "journal");
         var raftDir = Path.Combine(_cfg.DbPath, "raft");
         Directory.CreateDirectory(raftDir);
 
         _state = new RaftPersistentState(raftDir);
 
-        // Non-bootstrap nodes: pull initial snapshot from primary if their DB is fresh.
-        if (!_cfg.BootstrapPrimary && !Directory.Exists(Path.Combine(_cfg.DbPath, "CURRENT")))
+        // Non-bootstrap nodes: pull initial snapshot from primary only when the
+        // DB is fresh. CURRENT is a *file*; testing it with Directory.Exists
+        // made every restart wrongly re-pull a full snapshot over live data.
+        if (!_cfg.BootstrapPrimary && !File.Exists(Path.Combine(_cfg.DbPath, "CURRENT")))
         {
             await SyncInitialFromPrimaryAsync();
         }
 
-        var options = new DbOptions()
-            .SetCreateIfMissing(true)
-            .SetWalDir(walDir)
-            .SetWalTtlSeconds(120)
-            .SetMaxTotalWalSize(1024UL * 1024 * 32)
-            .SetWalSizeLimitMB(1024UL * 1024 * 4);
-        Db = RocksDb.Open(options, _cfg.DbPath);
-        Db.DisableFileDeletions();
+        OpenDatabase();
 
         var peers = _cfg.AllMembers.Where(m => m.NodeId != _cfg.NodeId)
                                    .Select(m => new ClusterMember(m.NodeId, m.Endpoint))
@@ -87,6 +93,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
             Log($"role -> {e.Role} (term {e.Term})");
         Node.ModeChanged += (s, e) =>
             Log($"mode -> {e.Mode}");
+        Node.ResyncRequired += (s, e) => TriggerResync();
 
         await StartServerAsync();
 
@@ -102,6 +109,61 @@ public sealed class ClusterNodeHost : IAsyncDisposable
             }
         }
     }
+
+    private void OpenDatabase()
+    {
+        var walDir = Path.Combine(_cfg.DbPath, "journal");
+        var options = new DbOptions()
+            .SetCreateIfMissing(true)
+            .SetWalDir(walDir)
+            .SetWalTtlSeconds(120)
+            .SetMaxTotalWalSize(1024UL * 1024 * 32)
+            .SetWalSizeLimitMB(1024UL * 1024 * 4);
+        Db = RocksDb.Open(options, _cfg.DbPath);
+        Db.DisableFileDeletions();
+    }
+
+    // -----------------------------------------------------------------------
+    // Write helpers (leader-side)
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Fire-and-forget write used by the load generator. Returns false when
+    /// this node is not the leader (or is rebuilding itself) so the generator
+    /// stops immediately after a step-down instead of polluting the local WAL.
+    /// </summary>
+    public bool TryWriteAsLeader(string key, string value)
+    {
+        if (_resyncing) return false;
+        if (Node is not { Role: RaftRole.Leader }) return false;
+        Db.Put(key, value);
+        return true;
+    }
+
+    /// <summary>
+    /// Write acknowledged only after the entry is committed (replicated to a
+    /// quorum). This is the durability contract Raft offers to clients.
+    /// </summary>
+    public async Task<bool> WriteCommittedAsync(string key, string value, TimeSpan timeout)
+    {
+        if (_resyncing || Node.Role != RaftRole.Leader) return false;
+        Db.Put(key, value);
+        ulong seq = Db.GetLatestSequenceNumber();
+        var sw = Stopwatch.StartNew();
+        while (sw.Elapsed < timeout)
+        {
+            if (Node.CommitSeq >= seq) return true;
+            if (Node.Role != RaftRole.Leader) return false;
+            await Task.Delay(15);
+        }
+        return false;
+    }
+
+    public string SerializeTerms() => _state!.Terms.Serialize();
+
+    // -----------------------------------------------------------------------
+    // Follower stream
+    // -----------------------------------------------------------------------
 
     private void OnLeaderChanged(object? sender, LeaderChangedEventArgs e)
     {
@@ -125,6 +187,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
 
     private void EnsureFollowerStream(string leaderId, string leaderEndpoint)
     {
+        if (_resyncing) return; // the resync flow re-attaches when it finishes
         if (_currentFollowingLeader == leaderId && _followerStreamTask is { IsCompleted: false }) return;
         CancelFollowerStream();
         _followerCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
@@ -137,11 +200,38 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     {
         while (!ct.IsCancellationRequested)
         {
+            GrpcChannel? ch = null;
+            CancellationTokenSource? connCts = null;
             try
             {
-                var ch = GrpcChannel.ForAddress(endpoint);
+                ch = GrpcChannel.ForAddress(endpoint);
                 var client = MagicOnionClient.Create<IClusterService>(ch);
-                ulong startSeq = Db.GetLatestSequenceNumber() + 1;
+
+                // Raft's AppendEntries consistency check, done once at attach
+                // time: the leader confirms that our (latestSeq, term) tail
+                // exists identically in its log. A diverged tail (uncommitted
+                // writes from a deposed leadership) cannot be truncated out of
+                // a RocksDB WAL, so the whole replica is rebuilt instead.
+                ulong myLatest = Db.GetLatestSequenceNumber();
+                var check = await client.CheckLogConsistencyAsync(new LogConsistencyRequest
+                {
+                    NodeId = _cfg.NodeId,
+                    FollowerLatestSeq = myLatest,
+                    FollowerTermAtLatest = Node.GetTermForSeq(myLatest),
+                });
+                if (!check.IsLeader)
+                {
+                    await Task.Delay(500, ct);
+                    continue;
+                }
+                if (!check.Consistent)
+                {
+                    Log($"log diverged from leader {leaderId}; scheduling full resync");
+                    TriggerResync();
+                    return;
+                }
+
+                ulong startSeq = myLatest + 1;
                 Log($"following {leaderId} from seq {startSeq:n0}");
                 var stream = await client.SyncUpdatesAsync(new SyncUpdatesRequest
                 {
@@ -149,23 +239,53 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                     StartSeq = startSeq,
                 });
 
+                connCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var reporterCt = connCts.Token;
+                // Report progress on a timer rather than every N batches so the
+                // leader's matchSeq (and therefore the commit index) keeps
+                // advancing even when the write load pauses.
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        using var rch = GrpcChannel.ForAddress(endpoint);
+                        var rclient = MagicOnionClient.Create<IClusterService>(rch);
+                        while (!reporterCt.IsCancellationRequested)
+                        {
+                            if (!_resyncing)
+                            {
+                                try { await rclient.ReportLastSyncSequenceNumber(_cfg.NodeId, Db.GetLatestSequenceNumber()); }
+                                catch { }
+                            }
+                            await Task.Delay(200, reporterCt);
+                        }
+                    }
+                    catch (OperationCanceledException) { }
+                }, reporterCt);
+
                 var consumer = new ReplicationConsumer(Db);
-                int n = 0;
                 while (await stream.ResponseStream.MoveNext(ct))
                 {
                     var batch = stream.ResponseStream.Current;
+
+                    // A faithful replica ingests the leader's batches at
+                    // exactly the same sequence numbers. Any gap means the
+                    // leader truncated WAL past our position; any overlap
+                    // means a local write slipped in. Both diverge the copy.
+                    ulong expected = Db.GetLatestSequenceNumber() + 1;
+                    if (batch.SequenceNumber != expected)
+                    {
+                        Log($"WAL stream mismatch: expected seq {expected:n0}, got {batch.SequenceNumber:n0}; scheduling full resync");
+                        batch.ReturnToPool();
+                        TriggerResync();
+                        return;
+                    }
+
                     Node.HandleObservedLeader(batch.LeaderId, batch.LeaderTerm);
-                    // record term -> seq range as we observe new terms
-                    var lastTerm = _state!.Terms.GetLast();
-                    if (batch.LeaderTerm != lastTerm.Term)
-                        _state.RecordTermRange(batch.SequenceNumber, batch.LeaderTerm);
+                    if (batch.EntryTerm > 0)
+                        _state!.RecordTermRange(batch.SequenceNumber, batch.EntryTerm);
                     consumer.IngestBatch(batch.SequenceNumber, batch.Data);
                     batch.ReturnToPool();
-                    n++;
-                    if (n % 500 == 0)
-                    {
-                        await client.ReportLastSyncSequenceNumber(_cfg.NodeId, Db.GetLatestSequenceNumber());
-                    }
                 }
             }
             catch (OperationCanceledException) { break; }
@@ -174,8 +294,18 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                 Log($"follower stream error: {ex.Message}; retrying in 1s");
                 try { await Task.Delay(1000, ct); } catch { }
             }
+            finally
+            {
+                connCts?.Cancel();
+                connCts?.Dispose();
+                ch?.Dispose();
+            }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Snapshot pull + full resync
+    // -----------------------------------------------------------------------
 
     private async Task SyncInitialFromPrimaryAsync()
     {
@@ -191,17 +321,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         {
             try
             {
-                var ch = GrpcChannel.ForAddress(primary.Endpoint);
-                var client = MagicOnionClient.Create<IClusterService>(ch);
-                var stream = await client.SyncInitialStateAsync();
-                Directory.CreateDirectory(_cfg.DbPath);
-                while (await stream.ResponseStream.MoveNext(CancellationToken.None))
-                {
-                    var file = stream.ResponseStream.Current;
-                    var dest = Path.Combine(_cfg.DbPath, file.FileName);
-                    await File.WriteAllBytesAsync(dest, file.Content);
-                }
-                Log("snapshot sync complete");
+                await PullSnapshotAsync(primary.Endpoint);
                 return;
             }
             catch (Exception ex)
@@ -212,6 +332,171 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         }
         throw new Exception("snapshot sync failed", last);
     }
+
+    private async Task PullSnapshotAsync(string endpoint)
+    {
+        using var ch = GrpcChannel.ForAddress(endpoint);
+        var client = MagicOnionClient.Create<IClusterService>(ch);
+        Directory.CreateDirectory(_cfg.DbPath);
+
+        // Per-file delta, with lazy hashing: scan local immutable files by
+        // name + size only, ask the source for hashes of the ones it also
+        // holds at that exact name + size, and hash our copies of just those
+        // candidates. Files that cannot match are never hashed on either side.
+        var local = ReplicationDelta.ScanImmutableFiles(_cfg.DbPath);
+        var verified = new List<FileInventoryItem>();
+        if (local.Count > 0)
+        {
+            var sourceHashes = await client.GetFileHashesAsync(
+                local.Select(f => new FileHashQuery { Name = f.FileName, Size = f.Size }).ToList());
+            var sizeByName = local.ToDictionary(f => f.FileName, f => f.Size);
+            foreach (var h in sourceHashes)
+            {
+                if (!h.Found) continue;
+                var localHash = await ReplicationDelta.ComputeFileSignatureAsync(Path.Combine(_cfg.DbPath, h.Name));
+                if (string.Equals(localHash, h.Hash, StringComparison.OrdinalIgnoreCase))
+                    verified.Add(new FileInventoryItem { Name = h.Name, Size = sizeByName[h.Name] });
+            }
+            Log($"snapshot delta: verified {verified.Count} of {local.Count} local files against the source");
+        }
+
+        var stream = await client.SyncInitialStateAsync(new SnapshotRequest { Files = verified });
+
+        bool planApplied = false;
+        int reused = 0;
+        int transferredFiles = 0;
+        long transferredBytes = 0;
+        FileStream? current = null;
+        string? currentName = null;
+        try
+        {
+            while (await stream.ResponseStream.MoveNext(_cts.Token))
+            {
+                var chunk = stream.ResponseStream.Current;
+                if (chunk.IsPlan)
+                {
+                    // Delete the journal directory and every local file the
+                    // leader didn't confirm (stale SSTs, MANIFEST, CURRENT)
+                    // before any new file lands; only raft/ (term + vote must
+                    // survive a rebuild) and our config file stay.
+                    ReplicationDelta.PrepareForRestore(_cfg.DbPath, chunk.KeepFiles, new[] { "raft", "node.json" });
+                    reused = chunk.KeepFiles.Count;
+                    planApplied = true;
+                    continue;
+                }
+                if (!planApplied)
+                    throw new InvalidOperationException("snapshot stream did not start with a delta plan");
+
+                if (currentName != chunk.FileName)
+                {
+                    current?.Dispose();
+                    currentName = chunk.FileName;
+                    current = new FileStream(Path.Combine(_cfg.DbPath, chunk.FileName), FileMode.Create, FileAccess.Write);
+                    transferredFiles++;
+                }
+                if (chunk.Content.Length > 0)
+                {
+                    await current!.WriteAsync(chunk.Content);
+                    transferredBytes += chunk.Content.Length;
+                }
+            }
+        }
+        finally
+        {
+            current?.Dispose();
+        }
+
+        // An empty stream means the source refused (not leader / resyncing);
+        // treating it as success would leave a half-initialized replica.
+        if (!planApplied)
+            throw new InvalidOperationException("snapshot source sent no data (leader unavailable?)");
+
+        // The restored log is byte-for-byte the leader's log, so the leader's
+        // term map is the correct description of it.
+        var terms = await client.GetRaftTermsAsync();
+        _state!.ReplaceTerms(RaftLogTerms.Deserialize(terms));
+        Log($"snapshot sync complete: reused {reused} local files, transferred {transferredFiles} files / {transferredBytes:n0} bytes");
+    }
+
+    public void TriggerResync()
+    {
+        if (_resyncing || _cts.IsCancellationRequested) return;
+        _ = Task.Run(PerformResyncAsync);
+    }
+
+    private async Task PerformResyncAsync()
+    {
+        if (!await _resyncGate.WaitAsync(0)) return;
+        try
+        {
+            if (_cts.IsCancellationRequested) return;
+            _resyncing = true;
+            Node.BeginResync();
+            CancelFollowerStream();
+            Log("resync: local log conflicts with the leader's; rebuilding replica from a leader snapshot");
+
+            // Give in-flight RPC handlers a moment to finish touching the DB
+            // before it is disposed.
+            await Task.Delay(1000);
+            Db.Dispose();
+
+            while (!_cts.IsCancellationRequested)
+            {
+                try
+                {
+                    var leader = await FindLeaderAsync();
+                    if (leader == null)
+                    {
+                        await Task.Delay(1000);
+                        continue;
+                    }
+                    // PullSnapshotAsync deletes the journal and every file the
+                    // leader doesn't confirm; unchanged SSTs are kept so the
+                    // rebuild only transfers the actual delta.
+                    await PullSnapshotAsync(leader.Endpoint);
+                    OpenDatabase();
+                    Node.CompleteResync(Db);
+                    _resyncing = false;
+                    Log($"resync complete at seq {Db.GetLatestSequenceNumber():n0}; rejoining {leader.NodeId}");
+                    EnsureFollowerStream(leader.NodeId, leader.Endpoint);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Log($"resync attempt failed: {ex.Message}; retrying in 1s");
+                    await Task.Delay(1000);
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            _resyncGate.Release();
+        }
+    }
+
+    private async Task<MemberConfig?> FindLeaderAsync()
+    {
+        foreach (var m in _cfg.AllMembers.Where(m => m.NodeId != _cfg.NodeId))
+        {
+            try
+            {
+                using var ch = GrpcChannel.ForAddress(m.Endpoint);
+                var client = MagicOnionClient.Create<IClusterService>(ch);
+                var s = await client.GetStatusAsync();
+                if (s.Role == nameof(RaftRole.Leader)) return m;
+                if (!string.IsNullOrEmpty(s.LeaderId) && s.LeaderId != _cfg.NodeId)
+                {
+                    var l = _cfg.AllMembers.FirstOrDefault(x => x.NodeId == s.LeaderId);
+                    if (l != null) return l;
+                }
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    // -----------------------------------------------------------------------
 
     private async Task StartServerAsync()
     {
@@ -245,7 +530,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         try { if (_appRunTask != null) await _appRunTask; } catch { }
         _transport.Dispose();
         Node?.Dispose();
-        Db?.Dispose();
+        if (!_resyncing) Db?.Dispose();
     }
 
     private void Log(string msg) =>

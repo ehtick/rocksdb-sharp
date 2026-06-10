@@ -14,8 +14,9 @@ namespace RocksDbSharp;
 ///  - the per-seqNo term log (so a recovering follower can answer
 ///    "what was the term of log entry X?")
 ///
-/// Everything is written atomically through a temp-file + rename so a crash
-/// mid-write cannot leave us with corrupt state.
+/// Everything is written through a temp-file that is flushed to disk and then
+/// renamed over the target, so a crash mid-write cannot leave us with corrupt
+/// state and an acknowledged vote/term can never be rolled back by power loss.
 /// </summary>
 public sealed class RaftPersistentState
 {
@@ -49,7 +50,10 @@ public sealed class RaftPersistentState
         get => (ClusterMode)Volatile.Read(ref _mode);
     }
 
-    public RaftLogTerms Terms => _terms;
+    public RaftLogTerms Terms
+    {
+        get { lock (_gate) return _terms; }
+    }
 
     public void SetMode(ClusterMode mode)
     {
@@ -88,15 +92,28 @@ public sealed class RaftPersistentState
 
     /// <summary>
     /// Record the term of a log range starting at <paramref name="startSeq"/>.
-    /// Persists immediately.
+    /// Persists immediately if the map changed.
     /// </summary>
     public void RecordTermRange(ulong startSeq, long term)
     {
         lock (_gate)
         {
-            _terms.Record(startSeq, term);
-            File.WriteAllText(TempPath(_termsPath), _terms.Serialize());
-            File.Move(TempPath(_termsPath), _termsPath, overwrite: true);
+            if (_terms.Record(startSeq, term))
+                AtomicWrite(_termsPath, _terms.Serialize());
+        }
+    }
+
+    /// <summary>
+    /// Replaces the whole term map. Used after a snapshot restore, when the
+    /// local log is byte-for-byte the leader's log so the leader's term map is
+    /// the correct description of it.
+    /// </summary>
+    public void ReplaceTerms(RaftLogTerms terms)
+    {
+        lock (_gate)
+        {
+            _terms = terms ?? throw new ArgumentNullException(nameof(terms));
+            AtomicWrite(_termsPath, _terms.Serialize());
         }
     }
 
@@ -106,10 +123,21 @@ public sealed class RaftPersistentState
         sb.Append(_currentTerm).Append('\n');
         sb.Append(_votedFor ?? string.Empty).Append('\n');
         sb.Append(_mode).Append('\n');
+        AtomicWrite(_statePath, sb.ToString());
+    }
 
-        string tmp = TempPath(_statePath);
-        File.WriteAllText(tmp, sb.ToString());
-        File.Move(tmp, _statePath, overwrite: true);
+    private static void AtomicWrite(string path, string content)
+    {
+        string tmp = path + ".tmp";
+        using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            var bytes = Encoding.UTF8.GetBytes(content);
+            fs.Write(bytes, 0, bytes.Length);
+            // Raft safety depends on term/vote surviving a crash *before* the
+            // RPC reply leaves this node, so force the data to disk.
+            fs.Flush(flushToDisk: true);
+        }
+        File.Move(tmp, path, overwrite: true);
     }
 
     private void Load()
@@ -144,7 +172,5 @@ public sealed class RaftPersistentState
             }
         }
     }
-
-    private static string TempPath(string path) => path + ".tmp";
 }
 #endif

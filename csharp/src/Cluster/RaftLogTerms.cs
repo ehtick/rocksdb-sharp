@@ -19,21 +19,33 @@ public sealed class RaftLogTerms
     private readonly List<(ulong StartSeq, long Term)> _ranges = new();
     private readonly object _gate = new();
 
-    public void Record(ulong startSeq, long term)
+    /// <summary>
+    /// Records that entries from <paramref name="startSeq"/> onwards belong to
+    /// <paramref name="term"/>. Returns true if the map changed. Stale or
+    /// out-of-order records are ignored rather than thrown on, because the
+    /// WAL-stream consumer may legitimately re-observe old batches after a
+    /// reconnect.
+    /// </summary>
+    public bool Record(ulong startSeq, long term)
     {
         lock (_gate)
         {
-            // If this term already started earlier, ignore - we only record the
-            // first sequence number of each term.
             if (_ranges.Count > 0)
             {
                 var last = _ranges[^1];
-                if (last.Term == term) return;
-                if (last.StartSeq > startSeq)
-                    throw new InvalidOperationException(
-                        $"Term ranges must be monotonic; new range starts at {startSeq} but last starts at {last.StartSeq}");
+                // We only record the first sequence number of each term.
+                if (term <= last.Term) return false;
+                if (startSeq < last.StartSeq) return false;
+                if (startSeq == last.StartSeq)
+                {
+                    // The previous term produced no entries (its range starts
+                    // beyond the log tail); the new term supersedes it.
+                    _ranges[^1] = (startSeq, term);
+                    return true;
+                }
             }
             _ranges.Add((startSeq, term));
+            return true;
         }
     }
 

@@ -36,8 +36,10 @@ public sealed class PeerState
 
     public void OnAppendSucceeded(ulong matchSeq)
     {
-        Interlocked.Exchange(ref _matchSeq, (long)matchSeq);
-        Interlocked.Exchange(ref _nextSeq, (long)matchSeq + 1);
+        // Progress reports race with heartbeat acknowledgements; whichever
+        // confirmed less must never roll an already-confirmed prefix back.
+        InterlockedMax(ref _matchSeq, (long)matchSeq);
+        InterlockedMax(ref _nextSeq, (long)matchSeq + 1);
         Interlocked.Exchange(ref _lastSuccessfulContactTicks, DateTime.UtcNow.Ticks);
         Volatile.Write(ref _reachable, 1);
     }
@@ -56,6 +58,28 @@ public sealed class PeerState
     public void RewindOnConflict(ulong newNextSeq)
     {
         Interlocked.Exchange(ref _nextSeq, (long)newNextSeq);
+    }
+
+    /// <summary>
+    /// Called when this node wins an election: matchSeq goes back to 0 (we
+    /// know nothing about the peer's log in the new term yet) and nextSeq is
+    /// positioned at the end of our own log (§5.3).
+    /// </summary>
+    public void ResetForNewTerm(ulong nextSeq)
+    {
+        Interlocked.Exchange(ref _matchSeq, 0);
+        Interlocked.Exchange(ref _nextSeq, (long)nextSeq);
+    }
+
+    private static void InterlockedMax(ref long location, long value)
+    {
+        long current = Interlocked.Read(ref location);
+        while (value > current)
+        {
+            long prev = Interlocked.CompareExchange(ref location, value, current);
+            if (prev == current) break;
+            current = prev;
+        }
     }
 }
 #endif
