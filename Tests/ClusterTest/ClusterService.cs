@@ -78,7 +78,7 @@ public class ClusterService : ServiceBase<IClusterService>, IClusterService
         return new UnaryResult<NodeStatus>(s);
     }
 
-    public async Task<ServerStreamingResult<ClusterFileData>> SyncInitialStateAsync()
+    public async Task<ServerStreamingResult<ClusterFileData>> SyncInitialStateAsync(SnapshotRequest req)
     {
         var stream = GetServerStreamingContext<ClusterFileData>();
         if (_host.IsResyncing) return stream.Result();
@@ -87,13 +87,31 @@ public class ClusterService : ServiceBase<IClusterService>, IClusterService
         var tempPath = Path.Combine(Path.GetTempPath(), "rocksdb_cluster_snap_" + Guid.NewGuid().ToString());
         using (var session = src.GetInitialState(tempPath))
         {
+            // Per-file delta: immutable files the consumer already holds
+            // byte-identically (name + size + SHA-256) are reused; new or
+            // changed files are streamed in full.
+            var plan = ReplicationDelta.Compute(
+                session.GetManifest(),
+                req.Files.Select(f => new ReplicationFileInfo { FileName = f.Name, Size = f.Size, Hash = f.Hash }));
+
+            await stream.WriteAsync(new ClusterFileData
+            {
+                IsPlan = true,
+                KeepFiles = plan.FilesToReuse,
+            });
+
+            // CURRENT names the live MANIFEST, so send it last: a consumer
+            // that dies mid-transfer is left without a CURRENT marker and
+            // will cleanly re-pull instead of opening a half-restored DB.
+            var ordered = plan.FilesToTransfer.OrderBy(f => f == "CURRENT" ? 1 : 0).ToList();
+
             // Chunked so one message stays well below the 4 MB gRPC cap no
             // matter how large the checkpoint SSTs are.
             const int ChunkSize = 1024 * 1024;
             var buffer = new byte[ChunkSize];
-            foreach (var file in session.Files)
+            foreach (var name in ordered)
             {
-                using (file)
+                using (var file = session.OpenFile(name))
                 {
                     bool sentAny = false;
                     int read;

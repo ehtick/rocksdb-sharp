@@ -336,9 +336,20 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     {
         using var ch = GrpcChannel.ForAddress(endpoint);
         var client = MagicOnionClient.Create<IClusterService>(ch);
-        var stream = await client.SyncInitialStateAsync();
         Directory.CreateDirectory(_cfg.DbPath);
 
+        // Per-file delta: offer our local immutable files; the leader tells us
+        // which ones to keep and only streams new or changed files, in full.
+        var inventory = ReplicationDelta.ScanImmutableFiles(_cfg.DbPath);
+        var stream = await client.SyncInitialStateAsync(new SnapshotRequest
+        {
+            Files = inventory.Select(f => new FileInventoryItem { Name = f.FileName, Size = f.Size, Hash = f.Hash }).ToList(),
+        });
+
+        bool planApplied = false;
+        int reused = 0;
+        int transferredFiles = 0;
+        long transferredBytes = 0;
         FileStream? current = null;
         string? currentName = null;
         try
@@ -346,14 +357,32 @@ public sealed class ClusterNodeHost : IAsyncDisposable
             while (await stream.ResponseStream.MoveNext(_cts.Token))
             {
                 var chunk = stream.ResponseStream.Current;
+                if (chunk.IsPlan)
+                {
+                    // Delete the journal directory and every local file the
+                    // leader didn't confirm (stale SSTs, MANIFEST, CURRENT)
+                    // before any new file lands; only raft/ (term + vote must
+                    // survive a rebuild) and our config file stay.
+                    ReplicationDelta.PrepareForRestore(_cfg.DbPath, chunk.KeepFiles, new[] { "raft", "node.json" });
+                    reused = chunk.KeepFiles.Count;
+                    planApplied = true;
+                    continue;
+                }
+                if (!planApplied)
+                    throw new InvalidOperationException("snapshot stream did not start with a delta plan");
+
                 if (currentName != chunk.FileName)
                 {
                     current?.Dispose();
                     currentName = chunk.FileName;
                     current = new FileStream(Path.Combine(_cfg.DbPath, chunk.FileName), FileMode.Create, FileAccess.Write);
+                    transferredFiles++;
                 }
                 if (chunk.Content.Length > 0)
+                {
                     await current!.WriteAsync(chunk.Content);
+                    transferredBytes += chunk.Content.Length;
+                }
             }
         }
         finally
@@ -361,11 +390,16 @@ public sealed class ClusterNodeHost : IAsyncDisposable
             current?.Dispose();
         }
 
+        // An empty stream means the source refused (not leader / resyncing);
+        // treating it as success would leave a half-initialized replica.
+        if (!planApplied)
+            throw new InvalidOperationException("snapshot source sent no data (leader unavailable?)");
+
         // The restored log is byte-for-byte the leader's log, so the leader's
         // term map is the correct description of it.
         var terms = await client.GetRaftTermsAsync();
         _state!.ReplaceTerms(RaftLogTerms.Deserialize(terms));
-        Log("snapshot sync complete");
+        Log($"snapshot sync complete: reused {reused} local files, transferred {transferredFiles} files / {transferredBytes:n0} bytes");
     }
 
     public void TriggerResync()
@@ -400,7 +434,9 @@ public sealed class ClusterNodeHost : IAsyncDisposable
                         await Task.Delay(1000);
                         continue;
                     }
-                    WipeDataDirectory();
+                    // PullSnapshotAsync deletes the journal and every file the
+                    // leader doesn't confirm; unchanged SSTs are kept so the
+                    // rebuild only transfers the actual delta.
                     await PullSnapshotAsync(leader.Endpoint);
                     OpenDatabase();
                     Node.CompleteResync(Db);
@@ -442,20 +478,6 @@ public sealed class ClusterNodeHost : IAsyncDisposable
             catch { }
         }
         return null;
-    }
-
-    private void WipeDataDirectory()
-    {
-        foreach (var dir in Directory.GetDirectories(_cfg.DbPath))
-        {
-            if (Path.GetFileName(dir).Equals("raft", StringComparison.OrdinalIgnoreCase)) continue;
-            Directory.Delete(dir, true);
-        }
-        foreach (var file in Directory.GetFiles(_cfg.DbPath))
-        {
-            if (Path.GetFileName(file).Equals("node.json", StringComparison.OrdinalIgnoreCase)) continue;
-            File.Delete(file);
-        }
     }
 
     // -----------------------------------------------------------------------

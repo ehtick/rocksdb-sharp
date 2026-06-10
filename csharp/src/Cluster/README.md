@@ -220,12 +220,27 @@ The resync itself (`ClusterNodeHost.PerformResyncAsync`):
   votes (a voter with a half-rebuilt log could help elect a candidate that
   lacks committed entries) and answer heartbeats with `"resyncing"` without
   touching the database;
-- the local DB is disposed and the data directory wiped **except** the
-  `raft/` state directory (term and vote must survive - they are promises);
-- a checkpoint is pulled from the current leader via the chunked
-  `SyncInitialStateAsync` stream, followed by the leader's term map
-  (`GetRaftTermsAsync`) - the restored log is byte-for-byte the leader's log,
-  so the leader's term map is its correct description;
+- the local DB is disposed and a **per-file delta transfer** runs against the
+  leader's checkpoint (`ReplicationDelta` in `csharp/src/Replication`, so the
+  plain replication path can use the same mechanism):
+  - the node offers an inventory of its local immutable files
+    (`.sst` / `.blob`) with sizes and SHA-256 hashes;
+  - the leader answers with a plan: files the node may **reuse** (present
+    byte-identically in the checkpoint) and then streams - chunked, in full -
+    only the files that are **new or changed**. Granularity is whole files;
+    there is no content-level patching. Name + size alone would not be safe:
+    once a replica stops sharing a lineage with the leader it allocates SST
+    file numbers independently, so equal names do not imply equal content;
+  - before anything lands, the node deletes its journal/WAL directory and
+    every local file the plan didn't confirm - stale or divergent SSTs, the
+    old `MANIFEST`/`CURRENT` - keeping only the `raft/` state directory
+    (term and vote must survive - they are promises);
+  - `CURRENT` is transferred last, so a node that dies mid-restore is left
+    without a valid DB marker and re-pulls cleanly on restart (reusing the
+    files it already received);
+- the leader's term map follows (`GetRaftTermsAsync`) - the restored log is
+  byte-for-byte the leader's log, so the leader's term map is its correct
+  description;
 - `Node.CompleteResync(newDb)` swaps the database in and re-arms the
   election timer, and the WAL stream re-attaches (passing the attach-time
   check this time).

@@ -21,7 +21,7 @@ public interface IClusterService : IService<IClusterService>
     UnaryResult<NodeStatus> GetStatusAsync();
 
     // ---- Snapshot + WAL stream (reused from replication path) ----
-    Task<ServerStreamingResult<ClusterFileData>> SyncInitialStateAsync();
+    Task<ServerStreamingResult<ClusterFileData>> SyncInitialStateAsync(SnapshotRequest req);
     Task<ServerStreamingResult<ClusterBatchData>> SyncUpdatesAsync(SyncUpdatesRequest req);
     UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seqNumber);
 
@@ -122,9 +122,32 @@ public class PeerInfo
 }
 
 /// <summary>
-/// One chunk of one checkpoint file. Files are streamed in contiguous chunks
-/// (a new FileName starts a new file) so a single message never exceeds the
-/// gRPC max-message size regardless of how large the SST files are.
+/// The consumer's side of a per-file delta snapshot transfer: the immutable
+/// files (.sst / .blob) it already holds, with sizes and content hashes. The
+/// source reuses matching files and only streams the new or changed ones, in
+/// full. An empty inventory degrades to a complete snapshot transfer.
+/// </summary>
+[MessagePackObject]
+public class SnapshotRequest
+{
+    [Key(0)] public List<FileInventoryItem> Files { get; set; } = new();
+}
+
+[MessagePackObject]
+public class FileInventoryItem
+{
+    [Key(0)] public string Name { get; set; } = "";
+    [Key(1)] public long Size { get; set; }
+    [Key(2)] public string Hash { get; set; } = "";
+}
+
+/// <summary>
+/// One message of the snapshot stream. The first message is the delta plan
+/// (<see cref="IsPlan"/> = true, <see cref="KeepFiles"/> lists the local files
+/// the consumer may reuse; everything else local must be deleted). Subsequent
+/// messages are chunks of checkpoint files - a new FileName starts a new file -
+/// so a single message never exceeds the gRPC max-message size regardless of
+/// how large the SST files are.
 /// </summary>
 [MessagePackObject]
 public class ClusterFileData
@@ -132,6 +155,8 @@ public class ClusterFileData
     [Key(0)] public string FileName { get; set; } = string.Empty;
     [Key(1)] public ulong FileSize { get; set; }
     [Key(2)] public byte[] Content { get; set; } = Array.Empty<byte>();
+    [Key(3)] public bool IsPlan { get; set; }
+    [Key(4)] public List<string> KeepFiles { get; set; } = new();
 }
 
 [MessagePackObject]
