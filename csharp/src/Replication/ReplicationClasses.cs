@@ -50,8 +50,11 @@ namespace RocksDbSharp
         }
 
         /// <summary>
-        /// Lists the checkpoint's files with size and, for immutable files,
-        /// a content hash - the source-side half of a per-file delta transfer.
+        /// Lists the checkpoint's files with their sizes - the source-side
+        /// half of a per-file delta transfer. Content hashes are deliberately
+        /// not computed here; candidates are verified on demand through the
+        /// hash-request exchange (<see cref="ReplicationDelta.TryHashCandidate"/>),
+        /// so files that cannot match by name + size are never hashed.
         /// </summary>
         public List<ReplicationFileInfo> GetManifest()
         {
@@ -63,9 +66,7 @@ namespace RocksDbSharp
                 {
                     FileName = fileInfo.Name,
                     Size = fileInfo.Length,
-                    Hash = ReplicationDelta.IsImmutableFile(fileInfo.Name)
-                        ? ReplicationDelta.ComputeFileHash(filePath)
-                        : string.Empty,
+                    Hash = string.Empty,
                 });
             }
             return result;

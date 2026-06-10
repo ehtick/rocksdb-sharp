@@ -223,14 +223,18 @@ The resync itself (`ClusterNodeHost.PerformResyncAsync`):
 - the local DB is disposed and a **per-file delta transfer** runs against the
   leader's checkpoint (`ReplicationDelta` in `csharp/src/Replication`, so the
   plain replication path can use the same mechanism):
-  - the node offers an inventory of its local immutable files
-    (`.sst` / `.blob`) with sizes and SHA-256 hashes;
-  - the leader answers with a plan: files the node may **reuse** (present
-    byte-identically in the checkpoint) and then streams - chunked, in full -
-    only the files that are **new or changed**. Granularity is whole files;
-    there is no content-level patching. Name + size alone would not be safe:
-    once a replica stops sharing a lineage with the leader it allocates SST
-    file numbers independently, so equal names do not imply equal content;
+  - the node scans its local immutable files (`.sst` / `.blob`) by name and
+    size only, then asks the leader for content hashes via
+    `GetFileHashesAsync`. The leader hashes only the files it also holds at
+    that exact name + size, and the node hashes only its copies of those
+    candidates - files that cannot match are never hashed on either side;
+  - the node sends the verified files as its inventory; the leader answers
+    with a plan: verified files are **reused**, and it streams - chunked, in
+    full - only the files that are **new or changed**. Granularity is whole
+    files; there is no content-level patching. The hash exchange matters
+    because name + size alone would not be safe: once a replica stops
+    sharing a lineage with the leader it allocates SST file numbers
+    independently, so equal names do not imply equal content;
   - before anything lands, the node deletes its journal/WAL directory and
     every local file the plan didn't confirm - stale or divergent SSTs, the
     old `MANIFEST`/`CURRENT` - keeping only the `raft/` state directory

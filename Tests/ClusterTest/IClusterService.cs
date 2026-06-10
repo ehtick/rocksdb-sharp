@@ -21,6 +21,7 @@ public interface IClusterService : IService<IClusterService>
     UnaryResult<NodeStatus> GetStatusAsync();
 
     // ---- Snapshot + WAL stream (reused from replication path) ----
+    UnaryResult<List<FileHashResult>> GetFileHashesAsync(List<FileHashQuery> files);
     Task<ServerStreamingResult<ClusterFileData>> SyncInitialStateAsync(SnapshotRequest req);
     Task<ServerStreamingResult<ClusterBatchData>> SyncUpdatesAsync(SyncUpdatesRequest req);
     UnaryResult<bool> ReportLastSyncSequenceNumber(string nodeId, ulong seqNumber);
@@ -122,10 +123,31 @@ public class PeerInfo
 }
 
 /// <summary>
+/// Hash request for one candidate file. The source computes a hash only when
+/// it holds an immutable file with this exact name *and* size - files that
+/// cannot match are never hashed on either side.
+/// </summary>
+[MessagePackObject]
+public class FileHashQuery
+{
+    [Key(0)] public string Name { get; set; } = "";
+    [Key(1)] public long Size { get; set; }
+}
+
+[MessagePackObject]
+public class FileHashResult
+{
+    [Key(0)] public string Name { get; set; } = "";
+    [Key(1)] public bool Found { get; set; }
+    [Key(2)] public string Hash { get; set; } = "";
+}
+
+/// <summary>
 /// The consumer's side of a per-file delta snapshot transfer: the immutable
-/// files (.sst / .blob) it already holds, with sizes and content hashes. The
-/// source reuses matching files and only streams the new or changed ones, in
-/// full. An empty inventory degrades to a complete snapshot transfer.
+/// files (.sst / .blob) it already holds AND has verified against the source
+/// through the <see cref="IClusterService.GetFileHashesAsync"/> exchange.
+/// The source reuses these and only streams new or changed files, in full.
+/// An empty inventory degrades to a complete snapshot transfer.
 /// </summary>
 [MessagePackObject]
 public class SnapshotRequest
@@ -138,7 +160,6 @@ public class FileInventoryItem
 {
     [Key(0)] public string Name { get; set; } = "";
     [Key(1)] public long Size { get; set; }
-    [Key(2)] public string Hash { get; set; } = "";
 }
 
 /// <summary>

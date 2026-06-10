@@ -78,6 +78,24 @@ public class ClusterService : ServiceBase<IClusterService>, IClusterService
         return new UnaryResult<NodeStatus>(s);
     }
 
+    /// <summary>
+    /// Hash-request half of the delta transfer: hashes are computed only for
+    /// files this node holds with the exact requested name and size. SSTs are
+    /// immutable, so hashing the live file is equivalent to hashing the copy a
+    /// later checkpoint would hard-link.
+    /// </summary>
+    public UnaryResult<List<FileHashResult>> GetFileHashesAsync(List<FileHashQuery> files)
+    {
+        var result = new List<FileHashResult>(files.Count);
+        bool resyncing = _host.IsResyncing;
+        foreach (var f in files)
+        {
+            string? hash = resyncing ? null : ReplicationDelta.TryHashCandidate(_host.DbPath, f.Name, f.Size);
+            result.Add(new FileHashResult { Name = f.Name, Found = hash != null, Hash = hash ?? "" });
+        }
+        return new UnaryResult<List<FileHashResult>>(result);
+    }
+
     public async Task<ServerStreamingResult<ClusterFileData>> SyncInitialStateAsync(SnapshotRequest req)
     {
         var stream = GetServerStreamingContext<ClusterFileData>();
@@ -87,12 +105,12 @@ public class ClusterService : ServiceBase<IClusterService>, IClusterService
         var tempPath = Path.Combine(Path.GetTempPath(), "rocksdb_cluster_snap_" + Guid.NewGuid().ToString());
         using (var session = src.GetInitialState(tempPath))
         {
-            // Per-file delta: immutable files the consumer already holds
-            // byte-identically (name + size + SHA-256) are reused; new or
-            // changed files are streamed in full.
+            // Per-file delta: the consumer lists immutable files it verified
+            // through GetFileHashesAsync; those are reused on a name + size
+            // match, everything new or changed is streamed in full.
             var plan = ReplicationDelta.Compute(
                 session.GetManifest(),
-                req.Files.Select(f => new ReplicationFileInfo { FileName = f.Name, Size = f.Size, Hash = f.Hash }));
+                req.Files.Select(f => new ReplicationFileInfo { FileName = f.Name, Size = f.Size, Hash = string.Empty }));
 
             await stream.WriteAsync(new ClusterFileData
             {

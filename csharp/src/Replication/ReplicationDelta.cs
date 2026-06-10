@@ -60,7 +60,10 @@ namespace RocksDbSharp
 
         /// <summary>
         /// Scans the top level of a database directory for immutable files that
-        /// are candidates for reuse in a delta transfer.
+        /// are candidates for reuse in a delta transfer. Hashes are not
+        /// computed here: they are only worth computing for files whose name
+        /// and size match on both sides, so callers verify candidates through
+        /// a hash-request exchange (<see cref="ComputeFileHash"/>) afterwards.
         /// </summary>
         public static List<ReplicationFileInfo> ScanImmutableFiles(string directory)
         {
@@ -74,15 +77,37 @@ namespace RocksDbSharp
                 {
                     FileName = info.Name,
                     Size = info.Length,
-                    Hash = ComputeFileHash(filePath),
+                    Hash = string.Empty,
                 });
             }
             return result;
         }
 
         /// <summary>
+        /// Hash-request helper for the source side: returns the hash of the
+        /// named file only when it exists in <paramref name="directory"/>, is
+        /// an immutable file, and matches <paramref name="expectedSize"/> -
+        /// otherwise null, without computing anything. Immutability is what
+        /// makes hashing the live file (rather than a checkpoint copy) valid.
+        /// </summary>
+        public static string TryHashCandidate(string directory, string fileName, long expectedSize)
+        {
+            if (string.IsNullOrEmpty(fileName) || Path.GetFileName(fileName) != fileName) return null;
+            if (!IsImmutableFile(fileName)) return null;
+            var path = Path.Combine(directory, fileName);
+            var info = new FileInfo(path);
+            if (!info.Exists || info.Length != expectedSize) return null;
+            return ComputeFileHash(path);
+        }
+
+        /// <summary>
         /// Splits the source manifest into files the consumer can keep and
-        /// files that must be transferred.
+        /// files that must be transferred. Reuse requires a name + size match
+        /// and, when both sides supply a content hash, agreeing hashes. When
+        /// hashes are omitted the consumer must only list files it has already
+        /// verified through the hash-request exchange: name + size alone do
+        /// not imply equal content, because two RocksDB instances allocate
+        /// file numbers independently once they stop sharing a lineage.
         /// </summary>
         public static ReplicationDeltaPlan Compute(
             IEnumerable<ReplicationFileInfo> sourceManifest,
@@ -103,8 +128,9 @@ namespace RocksDbSharp
                 bool reusable = IsImmutableFile(src.FileName)
                                 && byName.TryGetValue(src.FileName, out var local)
                                 && local.Size == src.Size
-                                && !string.IsNullOrEmpty(src.Hash)
-                                && string.Equals(local.Hash, src.Hash, StringComparison.OrdinalIgnoreCase);
+                                && (string.IsNullOrEmpty(src.Hash)
+                                    || string.IsNullOrEmpty(local.Hash)
+                                    || string.Equals(local.Hash, src.Hash, StringComparison.OrdinalIgnoreCase));
                 if (reusable) plan.FilesToReuse.Add(src.FileName);
                 else plan.FilesToTransfer.Add(src.FileName);
             }

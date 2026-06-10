@@ -27,6 +27,7 @@ public sealed class ClusterNodeHost : IAsyncDisposable
     public RocksDb Db { get; private set; } = null!;
     public RaftClusterNode Node { get; private set; } = null!;
 
+    public string DbPath => _cfg.DbPath;
     public bool IsResyncing => _resyncing;
     public bool WriteLoadEnabled
     {
@@ -338,13 +339,28 @@ public sealed class ClusterNodeHost : IAsyncDisposable
         var client = MagicOnionClient.Create<IClusterService>(ch);
         Directory.CreateDirectory(_cfg.DbPath);
 
-        // Per-file delta: offer our local immutable files; the leader tells us
-        // which ones to keep and only streams new or changed files, in full.
-        var inventory = ReplicationDelta.ScanImmutableFiles(_cfg.DbPath);
-        var stream = await client.SyncInitialStateAsync(new SnapshotRequest
+        // Per-file delta, with lazy hashing: scan local immutable files by
+        // name + size only, ask the source for hashes of the ones it also
+        // holds at that exact name + size, and hash our copies of just those
+        // candidates. Files that cannot match are never hashed on either side.
+        var local = ReplicationDelta.ScanImmutableFiles(_cfg.DbPath);
+        var verified = new List<FileInventoryItem>();
+        if (local.Count > 0)
         {
-            Files = inventory.Select(f => new FileInventoryItem { Name = f.FileName, Size = f.Size, Hash = f.Hash }).ToList(),
-        });
+            var sourceHashes = await client.GetFileHashesAsync(
+                local.Select(f => new FileHashQuery { Name = f.FileName, Size = f.Size }).ToList());
+            var sizeByName = local.ToDictionary(f => f.FileName, f => f.Size);
+            foreach (var h in sourceHashes)
+            {
+                if (!h.Found) continue;
+                var localHash = ReplicationDelta.ComputeFileHash(Path.Combine(_cfg.DbPath, h.Name));
+                if (string.Equals(localHash, h.Hash, StringComparison.OrdinalIgnoreCase))
+                    verified.Add(new FileInventoryItem { Name = h.Name, Size = sizeByName[h.Name] });
+            }
+            Log($"snapshot delta: verified {verified.Count} of {local.Count} local files against the source");
+        }
+
+        var stream = await client.SyncInitialStateAsync(new SnapshotRequest { Files = verified });
 
         bool planApplied = false;
         int reused = 0;
